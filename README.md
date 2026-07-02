@@ -1,195 +1,58 @@
-# IIT-Tirupati-Hackathon
+Per-class weights inside these losses are derived from inverse class
+frequency, since background pixels dominate the dataset (≈65% of all
+pixels) while a class like "well" makes up under 1% — without this
+weighting, a model could reach high overall accuracy just by predicting
+background everywhere and never learning the rare classes at all.
 
-**AI/ML Hackathon — Ministry of Panchayati Raj (MoPR), Government of India**
-Organised by the **Geospatial Intelligence & Applications Laboratory, IIT
-Tirupati Navavishkar I-Hub Foundation**, in partnership with **IIIT
-Tirupati** and the **National Informatics Centre (NIC)**.
+**Training setup:** AdamW optimiser with a `OneCycleLR` schedule (learning
+rate ramps up then anneals down over training, which tends to reach better
+minima faster than a flat rate); the pretrained encoder gets a lower
+learning rate than the newly-initialised decoder/head, since the encoder
+already "knows" general visual features and shouldn't be disturbed too
+aggressively. Training runs in mixed precision (`torch.cuda.amp`) for
+speed, and an EMA (Exponential Moving Average) shadow copy of the weights is
+maintained and used for evaluation — EMA weights tend to generalise better
+than the raw end-of-training weights because they average out the last few
+epochs' worth of noisy updates. Patches are 256×256, batch size 8, and two
+entire villages (`MURDANDA`, `28996_NADALA`) are permanently excluded from
+training and reserved purely for validation, so reported metrics reflect
+performance on villages the model has genuinely never seen — a much more
+honest test than validating on held-out patches from villages it *has*
+partially seen.
 
-This repository contains our team's solutions to **both problem statements**
-of the Geospatial Intelligence Hackathon, built entirely on drone-survey data
-collected under the **[SVAMITVA scheme](https://svamitva.nic.in/)** (Survey
-of Villages Abadi and Mapping with Improvised Technology in Village Areas) —
-India's national programme to survey and map rural inhabited ("abadi") land
-using drone imagery and LiDAR.
+**Inference-time techniques** — several tricks are layered on top of the
+raw model predictions to squeeze out extra accuracy without any retraining:
 
-| | Problem Statement 1 | Problem Statement 2 |
-|---|---|---|
-| **Goal** | Extract building/road/water/utility features from drone **orthophotos** | Generate a bare-earth **DTM** from LiDAR point clouds and design an optimised **drainage network** |
-| **Input** | RGB drone orthophoto GeoTIFFs + SVAMITVA cadastral shapefiles | Raw `.las`/`.laz` LiDAR point clouds |
-| **Core technique** | 3-model semantic segmentation ensemble (SegFormer + Mask2Former + custom dual-attention U-Net++) | PointNet-style regression (CSF ground filtering → `TerrainNet`) + D8 hydrology (`pysheds`) |
-| **Output** | 10-class feature raster / GeoPackage (roofs by material, roads, waterbodies, transformers, tanks, wells) | DTM GeoTIFF + drainage-network & waterlogging GeoJSON |
-| **Code** | [`hack.ipynb`](./hack.ipynb), [`Hackathon.ipynb`](./Hackathon.ipynb) | [`DTM_OptimizedDrainageGeneration-main/`](./DTM_OptimizedDrainageGeneration-main) |
-| **Sample data/outputs** | — | [`SVAMITVA_Data_DTM_MULTI-.../`](./SVAMITVA_Data_DTM_MULTI-20260623T143209Z-3-001) |
+- **Test-Time Augmentation (TTA):** the same image is fed through the model
+  8 times (combinations of horizontal flip, vertical flip, and 90° rotation)
+  and the predictions are averaged. Since the "true" segmentation shouldn't
+  change if you flip or rotate the input, averaging these 8 predictions
+  cancels out orientation-specific errors.
+- **Gaussian-weighted sliding-window stitching:** because full village
+  orthophotos are far too large to process in one shot, they're processed
+  patch-by-patch with overlapping windows, and each patch's contribution to
+  the final map is weighted by a Gaussian centred on the patch (full
+  confidence in the middle, tapering off towards the edges) — this avoids
+  the visible "seams" you'd otherwise see at patch boundaries.
+- **Per-class post-processing (`CLASS_CFG`):** each of the 10 classes gets
+  its own confidence threshold and minimum connected-component pixel count
+  before a detection is kept, plus an optional shape-regularisation step for
+  roof classes (nudging blobby predictions towards cleaner polygon shapes) —
+  because a correct detection threshold for a road (which might be one
+  contiguous strip hundreds of pixels wide) would completely miss a
+  transformer (which might only be 3-4 pixels across).
+- **Morphological cleanup:** small stray misclassified pixels are removed
+  with standard open/close morphological operations, and every prediction
+  is automatically visualised as a three-panel image (raw input orthophoto
+  / predicted segmentation / max-confidence heatmap) for quick visual QA.
 
----
-
-## Table of contents
-
-- [Why this project exists](#why-this-project-exists)
-- [Repository structure](#repository-structure)
-- [Problem Statement 1 — Feature Extraction](#problem-statement-1--ai-based-feature-extraction-from-drone-orthophotos)
-- [Problem Statement 2 — DTM & Drainage](#problem-statement-2--dtm-generation--optimized-drainage-network)
-- [Getting started](#getting-started)
-- [Data](#data)
-- [Results summary](#results-summary)
-- [Tech stack](#tech-stack)
-- [Team](#team)
-- [Acknowledgements](#acknowledgements)
-
----
-
-## Why this project exists
-
-Under SVAMITVA, drones have already surveyed **6+ lakh (600,000+) Indian
-villages**, producing high-resolution orthophotos and, for many, LiDAR point
-clouds. That raw imagery is extremely valuable, but today most of the
-downstream work — digitising building footprints, classifying roof
-materials, drawing roads and waterbodies, designing drainage systems — is
-still done **manually** by GIS technicians, which is slow and doesn't scale
-to hundreds of thousands of villages.
-
-Both problem statements in this hackathon ask: **can AI/ML turn the drone
-data India has already collected into ready-to-use planning layers,
-automatically?**
-
-- **Problem Statement 1** automates feature digitisation from orthophotos
-  (what's on the ground: which buildings, what they're made of, where the
-  roads/water/infrastructure are).
-- **Problem Statement 2** automates terrain modelling and drainage design
-  from LiDAR (what shape the ground is, and where water will naturally flow
-  or pool).
-
-Together they sketch an end-to-end pipeline: **drone survey → digitised
-features → terrain model → drainage plan**, all without an additional field
-survey.
-
----
-
-## Repository structure
-IIT-Tirupati-Hackathon/
-├── README.md
-├── hack.ipynb                                    ← Problem Statement 1, FINAL pipeline
-│                                                     (3-model segmentation ensemble)
-├── Hackathon.ipynb                               ← Problem Statement 1, EARLIER pipeline
-│                                                     (U-Net + Faster R-CNN, real training logs
-│                                                      + saved visualisations)
-│
-├── DTM_OptimizedDrainageGeneration-main/
-│   └── DTM_OptimizedDrainageGeneration-main/
-│       ├── DTM_Multi_Train.ipynb                 ← Problem Statement 2, Stage A:
-│       │                                            point cloud → TerrainNet → DTM
-│       └── DTM2OptimizedDrainageSystem.ipynb      ← Problem Statement 2, Stage B:
-│                                                     DTM → drainage network + waterlogging
-│
-└── SVAMITVA_Data_DTM_MULTI-20260623T143209Z-3-001/
-└── SVAMITVA_Data_DTM_MULTI/
-├── DSM_FILES/                            ← raw Digital Surface Models (6 villages)
-├── DTM_FILES/                            ← model-generated Digital Terrain Models
-├── SVAMITVA_Drainage_Output/              ← per-village drainage PNG + GeoJSON
-├── all_dtms_preview.png
-├── best_terrainnet.pth                   ← trained TerrainNet weights
-└── GeoIntel Drainage optimization Submission Doc.pdf   ← official submission writeup
-
-> `hack.ipynb` and `Hackathon.ipynb` both solve **Problem Statement 1** —
-> they are two different generations of the same pipeline, not two separate
-> problem statements. See the breakdown below for what changed between them.
-
----
-
-## Problem Statement 1 — AI-Based Feature Extraction from Drone Orthophotos
-
-> *"Develop an AI/ML model to identify key features from SVAMITVA Scheme
-> drone orthophotos."* — official scope
-
-**What it does:** given a village orthophoto, produce a pixel-level
-classification into 10 classes:
-
-| ID | Class | Source shapefile |
-|----|-------|-------------------|
-| 0 | Background | — |
-| 1 | RCC Roof | `Built_Up_Area_type.shp` |
-| 2 | Tiled Roof | `Built_Up_Area_type.shp` |
-| 3 | Tin Roof | `Built_Up_Area_type.shp` |
-| 4 | Thatched Roof | `Built_Up_Area_type.shp` |
-| 5 | Road | `Road.shp` |
-| 6 | Waterbody | `Water_Body.shp` |
-| 7 | Transformer | `Utility.shp` |
-| 8 | Tank | `Utility.shp` |
-| 9 | Well | `Utility.shp` |
-
-### `Hackathon.ipynb` — earlier two-headed pipeline
-
-Run on an HPC cluster (`/nfsshare/users/manjula/svamitva_project`). Splits
-the problem in two, because roofs/roads/water are **regions** while
-transformers/tanks/wells are tiny **point-like objects** that plain
-segmentation tends to miss:
-
-| Stage | What happens | Output |
-|---|---|---|
-| 1 — Mask generation | Orthophoto TIFs + 5 SVAMITVA shapefiles rasterised into per-pixel label masks | `data/training/masks_raster/*.tif` |
-| 2 — Patch extraction | Village rasters (up to 235,000×119,000 px) tiled into 256×256 patches, skipping mostly-empty tiles | `data/training/patches/{images,masks}/` |
-| 3 — Minority-class augmentation | Rare classes (utilities, thatched roofs) oversampled so class imbalance doesn't dominate | same patch dirs |
-| 4 — Train DuSA U-Net | Dual-attention U-Net trained for pixel-wise roof/road/water segmentation | `outputs/best_model.pth` |
-| 5 — Train Faster R-CNN | Detector trained specifically on utility bounding boxes, with hard-negative mining | `outputs/final/faster_rcnn_utilities.pth` |
-| 6 — Inference | Both models run over held-out villages | `outputs/predictions/`, `outputs/rcnn_utilities/` |
-| 7 — Merge/evaluate/visualise | Segmentation + detections merged into one feature layer, metrics + charts produced | `outputs/final_predictions/` |
-
-**Real logged results** (saved in the notebook's own outputs) — Faster
-R-CNN utility detector, 40 epochs, 4,275 train / 1,069 val patches:
-
-| Epoch | Precision | Recall |
-|-------|-----------|--------|
-| 1 | 100.00% | 0.42% |
-| 10 | 88.81% | 82.30% |
-| 20 | 91.87% | 85.24% |
-| 40 | 91.39% | 86.70% |
-
-CLI (defined inside the notebook itself):
-```bash
-python svamitva_pipeline.py --stage all      # everything
-python svamitva_pipeline.py --stage 1        # masks only
-python svamitva_pipeline.py --stage 1,2,3    # data prep only
-python svamitva_pipeline.py --stage 4,5      # training only
-```
-
-### `hack.ipynb` — final ensemble pipeline
-
-The final version drops the separate R-CNN head and instead handles **all
-10 classes — including the tiny utility points — as segmentation**, using
-lower confidence thresholds and smaller minimum-pixel counts for point-like
-classes to compensate for their small footprint. Three architectures are
-trained independently and combined with a weighted soft-voting ensemble.
-
-**Models:**
-
-| Model | Backbone | Why it's in the ensemble |
-|---|---|---|
-| `DuSAUNetPP` | Custom U-Net++ with **Channel + Spatial Dual Attention** blocks and an **ASPP** bottleneck (atrous rates 1/6/12/18), plus deep-supervision auxiliary heads | Sharp building/road boundaries, cheap to train from scratch |
-| `SegFormerB5` | HuggingFace `nvidia/segformer-b5-finetuned-ade-640-640`, fine-tuned to 10 classes | Strong global context, good for large uniform regions |
-| `Mask2FormerSeg` | HuggingFace `facebook/mask2former-swin-base-coco-panoptic`, fine-tuned to 10 classes | Query-based masks, good at separating adjacent roof instances |
-
-`EnsembleModel` fuses the three softmax probability maps with tunable
-weights `(w_segformer, w_mask2former, w_unetpp)`, default `(0.45, 0.35, 0.20)`.
-
-**Loss function:**
-loss = 0.3·LabelSmoothingCE + 0.4·DiceLoss + 0.2·FocalLoss(γ=2) + 0.1·BoundaryLoss
-Class weights computed from inverse class frequency so rare utility classes
-aren't drowned out (background ≈ 65% of pixels vs. transformer/well ≈ 0.6-0.7%).
-
-**Training:** AdamW, `OneCycleLR`, separate (lower) LR for the pretrained
-encoder vs. decoder/head, mixed precision + EMA weight averaging, 256×256
-patches, batch size 8. Two villages (`MURDANDA`, `28996_NADALA`) are always
-held out for validation.
-
-**Inference:** 8-way test-time augmentation (rotation × flips), Gaussian-
-weighted sliding-window stitching for seamless large rasters, per-class
-confidence thresholds + minimum connected-component size + optional shape
-regularisation, morphological cleanup, and automatic prediction
-visualisations (input / segmentation / confidence heatmap).
-
-**Ensemble weight tuning:** grid search over `(w1, w2, w3)` in 0.05 steps on
-held-out villages, picks the combination maximising mean IoU → saved to
-`outputs/best_weights.json`.
+**Ensemble weight tuning:** after all three models are trained
+independently, a dedicated tuning step does a grid search over ensemble
+weights `(w1, w2, w3)` in steps of 0.05 across the held-out validation
+villages, and keeps whichever combination maximises mean IoU (Intersection
+over Union — see the glossary below) — this is more reliable than simply
+guessing weights, since the "best" model isn't necessarily the one that
+should get the most trust in every scenario.
 
 CLI:
 ```bash
@@ -202,9 +65,9 @@ python svamitva_pipeline.py --phase all        # all of the above in order
 ```
 
 > **Path note:** both notebooks hard-code absolute paths from the team's own
-> HPC training environment (e.g. `/nfsshare/users/P126014014/...`). Edit the
-> `CFG` / `HPC_BASE` / `ROOT_DIR` constants near the top before re-running
-> against your own data.
+> HPC training environment (e.g. `/nfsshare/users/P126014014/...`). Before
+> re-running against your own data, edit the `CFG` / `HPC_BASE` / `ROOT_DIR`
+> constants near the top of the relevant notebook.
 
 ---
 
@@ -214,71 +77,176 @@ python svamitva_pipeline.py --phase all        # all of the above in order
 > data and design drainage networks for densely inhabited village (abadi)
 > areas."* — official scope
 
-**Team:** Harshini S, Gayathri Gopal Peshwa, Kaaviya Varshini T (SASTRA
-Deemed University), advised by Dr. S. Kamakshi and Dr. K.R. Manjula.
+### What this problem is actually solving
+
+A raw LiDAR scan captures the height of *everything* the laser hits — roofs,
+treetops, power lines, as well as the actual ground. If you want to
+understand how water will flow across a village during heavy rain, none of
+that "clutter" is useful — you specifically need the **bare-earth
+elevation**, stripped of every building and every tree. Reconstructing that
+bare-earth surface from a cluttered point cloud is Stage A of this pipeline.
+Once you have that clean terrain surface, Stage B applies well-established
+hydrology math to it — the same category of algorithm used in professional
+watershed-analysis GIS software — to trace where rainwater would naturally
+converge into channels, and where it would pool because it has nowhere to
+drain.
 
 ### Stage A — `DTM_Multi_Train.ipynb`: Point Cloud → DTM
 
-1. **Load point cloud** (`laspy`) — up to ~9-23 million raw points per
-   village. A stratified spatial-bin sampler caps this at **400,000 points**
-   while keeping even spatial coverage.
-2. **Ground classification** — the **Cloth Simulation Filter (CSF)** drapes
-   a virtual cloth over the inverted point cloud; points it settles on are
-   classified as ground vs. non-ground (buildings/vegetation). Example run:
-   9.8M raw points → 396K sampled → 65.5% classified as ground.
-3. **Terrain roughness weighting** — a reference DTM is smoothed (5×5
-   uniform filter) and compared to the raw DTM to get a per-pixel roughness
-   map; points in rough/noisy cells get lower training weight
-   (`reliable=1.0`, `moderate=0.5`, `noisy=0.1`).
-4. **Feature extraction** — 20-D feature vector per point from raw/centered/
-   normalised XYZ plus **20-nearest-neighbour** statistics (`KDTree`):
-   mean/std/min neighbour height, height above local mean/min, CSF ground
-   label, intensity, colour, return number.
-5. **Blocking** — points grouped into 10 m × 10 m spatial blocks with 50%
-   overlap (min. 64 points/block); targets z-score normalised per block.
-6. **`TerrainNet` model** — PointNet-style: a **point branch** (1×1 Conv1D)
-   encoding each point individually, a **global branch** pooling
-   (max+mean+std) for block-level context, and a **neighbour branch** (1×1
-   Conv2D over each point's k-NN neighbourhood) for local geometry — all
-   three concatenated and regressed down to a predicted elevation per point.
-7. **Loss** — Huber loss (δ=0.5) weighted by `CSF ground-label × terrain
-   roughness`, plus a gradient-consistency term penalising inconsistent
-   elevation *differences* between neighbours (keeps terrain smooth).
-8. **Optimisation** — two-phase schedule: **AdamW + OneCycleLR** for the
-   first 70% of epochs, then **SGD + Nesterov momentum + Cosine Annealing**
-   for the remaining 30%.
-9. **Augmentation** — random Z-axis rotation, small Z jitter, random point
-   dropout per batch.
-10. **Multi-village generalisation** — trained jointly on 6 villages across
-    **Rajasthan, Punjab and Gujarat**; **KHAPRETA (Gujarat)** held out
-    completely.
+1. **Load the point cloud** (`laspy`). Raw village scans in this dataset
+   range from about 9.8 million to 23.4 million points. Since that's far too
+   many to train on directly, a **stratified spatial-bin sampler** reduces
+   each village down to a manageable 400,000 points while deliberately
+   preserving even coverage across the whole village footprint — a naive
+   random sample would otherwise over-represent densely-scanned areas and
+   under-represent sparse ones.
+2. **Ground classification with CSF.** The **Cloth Simulation Filter**
+   imagines flipping the point cloud upside down and draping a virtual
+   piece of cloth over it under gravity — the cloth settles onto the
+   "highest" points from this inverted view, which correspond to the ground
+   surface in the original orientation (since gravity would otherwise pull
+   the cloth down onto the true ground, but buildings and trees block it
+   from reaching there). Points the cloth rests on are labelled ground;
+   everything else (buildings, vegetation) is labelled non-ground. In one
+   example village run, 9.8M raw points sampled down to 396K resulted in
+   65.5% being classified as ground.
+3. **Terrain roughness weighting.** A reference DTM is smoothed with a 5×5
+   uniform filter, and the difference between the smoothed and raw surface
+   gives a per-pixel "roughness" score. Areas with high roughness usually
+   indicate noisy, less-trustworthy elevation data (rather than genuinely
+   jagged terrain), so points sampled there are down-weighted during
+   training: `reliable → weight 1.0`, `moderate → weight 0.5`,
+   `noisy → weight 0.1`. This stops the model from being misled by bad
+   ground-truth data instead of learning genuine terrain patterns.
+4. **Feature extraction.** Every point gets a 20-dimensional feature vector:
+   its raw XYZ position, a centered version, a normalised version, plus
+   statistics computed from its **20 nearest spatial neighbours** (via
+   `KDTree`) — mean/std/min neighbour height, and how far above the local
+   mean/minimum the point sits — along with its CSF ground label, laser
+   return intensity, colour, and return number where available. These
+   neighbourhood statistics are what let the model reason about local
+   terrain shape rather than just memorising isolated elevation values.
+5. **Blocking.** Points are grouped into overlapping 10 m × 10 m spatial
+   blocks (50% overlap, minimum 64 points per block), and target elevations
+   within each block are z-score normalised — this lets the network learn
+   *relative* terrain shape within a local neighbourhood rather than
+   absolute elevation values, which vary hugely from village to village.
+6. **The `TerrainNet` model** — a PointNet-style neural network purpose
+   built for unordered 3D point data (unlike images, point clouds have no
+   fixed grid, so ordinary convolutions don't directly apply). It combines
+   three branches: a **point branch** that encodes each point independently
+   through 1×1 convolutions, a **global branch** that pools the point
+   branch's output (via max, mean and standard deviation) to summarise the
+   whole block's context, and a **neighbour branch** that processes each
+   point's local k-nearest-neighbour patch through 2D convolutions to
+   capture fine local geometry. All three branches' outputs are
+   concatenated and passed through fully-connected layers down to a single
+   predicted elevation value per point.
+7. **Loss function.** A Huber loss (robust to outliers, unlike plain MSE)
+   weighted by the combination of CSF ground-label confidence and terrain
+   roughness reliability, plus a gradient-consistency term that penalises
+   the model when the *differences* in elevation between neighbouring
+   predicted points don't match the *differences* in the true elevations —
+   this keeps the predicted terrain surface physically smooth rather than
+   noisy point-to-point.
+8. **Two-phase optimisation schedule.** Training starts with **AdamW +
+   OneCycleLR** for the first 70% of epochs (fast, adaptive early
+   convergence), then switches to **SGD with Nesterov momentum + Cosine
+   Annealing** for the remaining 30% — a well-known trick where SGD's
+   simpler, noisier updates in the late stages tend to find flatter, better-
+   generalising minima than AdamW alone.
+9. **Data augmentation.** Each training batch is randomly rotated around
+   the vertical (Z) axis, given a small amount of elevation jitter, and has
+   a fraction of its points randomly dropped and resampled — all of which
+   make the model robust to the arbitrary orientation and point density it
+   will encounter on new, unseen villages.
+10. **Multi-village training with a genuine held-out test.** The model is
+    trained jointly across six villages spanning **three different Indian
+    states — Rajasthan, Punjab and Gujarat** — so it has to learn terrain
+    patterns general enough to transfer across regions, not just memorise
+    one local landscape. **KHAPRETA (Gujarat) is excluded entirely from
+    training** and used purely as a final test of generalisation.
 
-**Result:** MAE ≈ **0.117 m** on the fully held-out KHAPRETA village —
-i.e. predicted ground elevation is, on average, within ~11.7 cm of the
-reference DTM on a village/state never seen during training.
+**Result:** on KHAPRETA, the model achieves a **Mean Absolute Error of
+approximately 0.117 metres** — meaning its predicted ground elevation is, on
+average, within about 11.7 centimetres of the true reference DTM, on a
+village and terrain type it never saw during training. For context, this is
+well within the accuracy needed for village-scale drainage planning.
 
 ### Stage B — `DTM2OptimizedDrainageSystem.ipynb`: DTM → Drainage Network
 
-Runs classic D8 hydrology using **`pysheds`** on the DTMs from Stage A:
+This stage takes the DTM produced by Stage A (or any bare-earth GeoTIFF) and
+runs it through standard hydrological flow-modelling using **`pysheds`** —
+the same underlying algorithm family used in professional watershed
+analysis tools:
 
 1. **Hydrological conditioning** — `fill_pits` → `fill_depressions` →
-   `resolve_flats`, removing artifacts that would trap simulated flow.
-2. **Flow direction & accumulation** — D8 flow direction, then flow
-   accumulation per cell.
-3. **Multi-tier drainage classification** by flow-accumulation percentile:
-   **Primary** (top ~1-2%), **Secondary** (next ~2-3%), **Tertiary** (next
-   ~5-8%) — two percentile presets included (98/95/90 and 99/97/95).
-4. **Waterlogging hotspot detection** — flagged where **low slope** (bottom
-   25th pct) + **high flow accumulation** (top 75th pct) + **low elevation**
-   (bottom 30th pct) coincide.
-5. **Vectorisation & export** — each class exported as point geometries in
-   a single combined **GeoJSON** per village, directly usable in
-   QGIS/ArcGIS/Google Earth Engine.
-6. **Visualisation** — PNG overlay per village: normalised DTM in greyscale
-   with primary (cyan), secondary (orange), tertiary (green) and
-   waterlogging (red) layers on top.
+   `resolve_flats`. Real-world (and predicted) elevation data almost always
+   contains small artificial pits and flat spots that would otherwise trap
+   simulated water in a single pixel forever; this conditioning step removes
+   those artifacts so flow can be traced continuously across the whole
+   surface.
+2. **Flow direction and accumulation.** Using the **D8 method** (each cell's
+   water is assumed to flow into whichever one of its 8 neighbouring cells
+   is steepest downhill), the algorithm computes a flow-direction grid, then
+   a flow-accumulation grid — the number of upstream cells that eventually
+   drain through each cell. High accumulation values mark natural channels;
+   low values mark ridges and slopes.
+3. **Multi-tier drainage classification.** Flow-accumulation values are
+   split into percentile-based tiers: **Primary channels** (roughly the top
+   1-2% of accumulation — the main drainage lines that carry the most
+   water), **Secondary channels** (the next 2-3%), and **Tertiary channels**
+   (the next 5-8%, smaller feeder channels). Two percentile presets are
+   included in the notebook (a stricter 98/95/90 split and a looser
+   99/97/95 split) so the density of the resulting drainage network can be
+   tuned to how conservative or comprehensive the output should be.
+4. **Waterlogging hotspot detection.** A location is flagged as a
+   waterlogging risk when three conditions coincide: **low slope** (bottom
+   25th percentile — the ground is nearly flat), **high flow accumulation**
+   (top 75th percentile — a lot of water naturally converges there), and
+   **low elevation** (bottom 30th percentile — it sits in a local low
+   point). Flat, low-lying spots that water flows into but can't easily
+   flow out of are exactly where waterlogging and localised flooding tend
+   to occur in practice.
+5. **Vectorisation and export.** Every classified cell (primary/secondary/
+   tertiary/waterlog) is converted from a raster pixel into a point
+   geometry and exported as a single combined **GeoJSON** file per village
+   — a standard vector format that opens directly in QGIS, ArcGIS, or
+   Google Earth Engine without any conversion step.
+6. **Visualisation.** A PNG is generated per village showing the normalised
+   DTM in greyscale as a base layer, with the primary (cyan), secondary
+   (orange), tertiary (green) drainage channels and waterlogging zones (red)
+   overlaid — dilated slightly so thin channels remain visible at a glance.
 
-Batch mode loops `process_dtm()` over every `.tif` in the input folder.
+The whole batch process simply loops `process_dtm()` over every `.tif` file
+found in the input folder, so an entire state's worth of processed villages
+can be run through in one unattended pass.
+
+---
+
+## Glossary — terms used throughout this repo
+
+For anyone newer to geospatial ML, a quick reference for terms used above:
+
+| Term | Meaning |
+|---|---|
+| **Orthophoto** | An aerial photo that's been geometrically corrected so every pixel's position accurately matches its true location on the ground (unlike a raw, uncorrected photo, which distorts near the edges) |
+| **DSM (Digital Surface Model)** | An elevation model of the *top* surface — includes roofs, trees, everything the sensor first hits |
+| **DTM (Digital Terrain Model)** | An elevation model of the *bare ground only*, with buildings and vegetation removed — what Stage A of Problem Statement 2 predicts |
+| **Point cloud** | A set of individual 3D points (x, y, z, plus extra attributes) captured by a laser scanner (LiDAR); has no fixed grid structure, unlike an image |
+| **Semantic segmentation** | A computer vision task where every pixel of an image is classified into a category, producing a full labelled map rather than just a single label for the whole image |
+| **Shapefile (`.shp`)** | A common GIS vector file format storing geographic features as points/lines/polygons with attached attribute data |
+| **Rasterise** | Convert vector data (like shapefile polygons) into a pixel grid, so it can be compared against or overlaid on an image |
+| **IoU (Intersection over Union)** | A segmentation accuracy metric: the overlap area between predicted and true regions, divided by their combined area — 100% means a perfect match |
+| **Mean IoU (mIoU)** | The IoU averaged across all classes, commonly used as the single headline number for comparing segmentation models |
+| **Precision** | Of everything the model predicted as positive, what fraction was actually correct |
+| **Recall** | Of everything that was actually positive, what fraction the model successfully found |
+| **CSF (Cloth Simulation Filter)** | An algorithm that separates ground points from non-ground points in a LiDAR point cloud by simulating a cloth draping over the (inverted) terrain |
+| **D8 flow direction** | A hydrology algorithm that assigns each terrain cell's water flow to whichever one of its 8 neighbouring cells is steepest downhill |
+| **Flow accumulation** | For each cell in a terrain grid, the number of upstream cells whose water eventually flows through it — high values indicate natural drainage channels |
+| **Ensemble (model)** | Combining the predictions of multiple independently-trained models, usually by averaging or voting, to get a result that's more robust than any single model alone |
+| **Test-Time Augmentation (TTA)** | Running the same input through a model multiple times with small transformations (flips/rotations) applied, then averaging the results, to reduce orientation-specific prediction errors |
+| **EMA (Exponential Moving Average)** | Keeping a running, smoothed average of a model's weights throughout training, which often generalises better than the raw final-epoch weights |
 
 ---
 
@@ -306,19 +274,23 @@ pip install laspy lazrs cloth-simulation-filter torch scikit-learn scipy \
 
 `rasterio` / `geopandas` / `pysheds` all depend on **GDAL** being installed
 at the OS level first (`apt install gdal-bin libgdal-dev` on Ubuntu,
-`brew install gdal` on macOS).
+`brew install gdal` on macOS) — installing the Python packages alone isn't
+enough.
 
 ### 3. Run
 
 Open `hack.ipynb`, `Hackathon.ipynb`, `DTM_Multi_Train.ipynb` or
-`DTM2OptimizedDrainageSystem.ipynb` in Jupyter/Colab and run top-to-bottom.
+`DTM2OptimizedDrainageSystem.ipynb` in Jupyter or Google Colab and run
+top-to-bottom.
 
 > Both problem statements' code has **absolute paths hard-coded** near the
-> top (HPC cluster paths for PS1, Google Drive paths for PS2, since
-> `DTM_Multi_Train.ipynb` and `DTM2OptimizedDrainageSystem.ipynb` were
-> developed on Google Colab with `google.colab.drive` mounted). Update the
-> path constants (`CFG`, `HPC_BASE`, `ROOT_DIR`, `LAZ_FILES`, `DTM_FILES`,
-> `INPUT_DIR`, `OUTPUT_DIR`, etc.) before running against your own data.
+> top — HPC cluster paths for Problem Statement 1, and Google Drive paths
+> for Problem Statement 2 (since `DTM_Multi_Train.ipynb` and
+> `DTM2OptimizedDrainageSystem.ipynb` were developed on Google Colab with
+> `google.colab.drive` mounted). Before running against your own data,
+> update the relevant path constants (`CFG`, `HPC_BASE`, `ROOT_DIR`,
+> `LAZ_FILES`, `DTM_FILES`, `INPUT_DIR`, `OUTPUT_DIR`, etc.) near the top of
+> each notebook.
 
 ---
 
@@ -326,23 +298,25 @@ Open `hack.ipynb`, `Hackathon.ipynb`, `DTM_Multi_Train.ipynb` or
 
 - **Problem Statement 1** input (orthophoto GeoTIFFs + shapefiles) is not
   bundled in this repo — it's multi-GB drone imagery distributed by MoPR/NIC
-  for the hackathon.
+  specifically for the hackathon.
 - **Problem Statement 2** input/output is partly bundled in
   `SVAMITVA_Data_DTM_MULTI-20260623T143209Z-3-001/`, covering six villages —
   **67169_5NKR_CHAKHIRASINGH** (Rajasthan), **Dhal_Hoshiarpur** (Punjab),
-  **KHAPRETA** (Gujarat, held-out test), **DHUNDA_FATEHGARH SAHIB**
-  (Punjab), **64334_2H (REFLIGHT)** (Rajasthan), **DEVDI** (Gujarat):
+  **KHAPRETA** (Gujarat, held-out test village), **DHUNDA_FATEHGARH SAHIB**
+  (Punjab), **64334_2H (REFLIGHT)** (Rajasthan), and **DEVDI** (Gujarat):
   - `DSM_FILES/` — raw Digital Surface Models
   - `DTM_FILES/` — model-generated Digital Terrain Models
   - `SVAMITVA_Drainage_Output/` — per-village drainage PNG + GeoJSON layers
-  - `best_terrainnet.pth` — trained TerrainNet weights
-  - `all_dtms_preview.png` — preview of all six generated DTMs
+  - `best_terrainnet.pth` — trained TerrainNet weights, ready to load directly
+  - `all_dtms_preview.png` — a single preview image of all six generated DTMs side by side
   - `GeoIntel Drainage optimization Submission Doc.pdf` — the official
-    hackathon submission writeup, including the full 5-stage methodology,
-    tech stack, results and roadmap (this README summarises it above)
+    hackathon submission writeup, covering the full 5-stage methodology,
+    technology stack, results, and future roadmap (much of this README's
+    Problem Statement 2 section is drawn directly from it)
 
-For the full source dataset (raw point clouds, additional villages), see the
-Drive link referenced in the submission PDF.
+For the full source dataset — including additional villages and the raw
+point clouds — see the Google Drive link referenced inside the submission
+PDF.
 
 ---
 
@@ -354,6 +328,13 @@ Drive link referenced in the submission PDF.
 | Faster R-CNN utility detector — recall | **86.7%** (epoch 40) | `Hackathon.ipynb`, real training log |
 | TerrainNet ground-elevation MAE on held-out village | **≈ 0.117 m** | KHAPRETA (Gujarat), never seen during training — official submission document |
 | CPU-only DTM + drainage inference time | **< 10 minutes / village** | Official submission document |
+
+The final ensemble segmentation pipeline (`hack.ipynb`) additionally
+generates a full evaluation suite whenever `--phase evaluate` or
+`--phase tune` is run — per-class IoU/F1/precision/recall bar charts,
+normalised confusion matrices, and side-by-side model comparison plots —
+useful for understanding exactly which classes each of the three ensemble
+members is strongest and weakest at.
 
 ---
 
@@ -369,8 +350,26 @@ Drive link referenced in the submission PDF.
 | Visualisation | Matplotlib, Seaborn |
 | Compute environments used | HPC cluster (Problem Statement 1 training), Google Colab (Problem Statement 2 training) |
 
-Everything is built on **open-source libraries only** — no proprietary GIS
-licenses required, which matters for a solution meant to eventually run at
-the scale of India's 600,000+ villages.
+Every dependency here is **open-source**, with no proprietary GIS licenses
+required — a deliberate choice, since a solution meant to eventually run
+across India's 600,000+ villages needs to be economically viable to deploy
+at that scale.
 
 ---
+
+## Acknowledgements
+
+- **Ministry of Panchayati Raj (MoPR)**, Government of India — hackathon
+  organiser and owner of the SVAMITVA scheme.
+- **IIT Tirupati Navavishkar I-Hub Foundation**, **IIIT Tirupati**, and the
+  **National Informatics Centre (NIC)** — hackathon partners.
+- The **SVAMITVA scheme** field survey teams, for the underlying drone
+  orthophoto and LiDAR data that made this project possible.
+
+---
+
+## License
+
+No license file was provided with the original hackathon submission. Add a
+`LICENSE` file here (MIT/Apache-2.0 are common choices for hackathon code)
+before treating this repository as open for reuse.
