@@ -1,3 +1,253 @@
+# IIT-Tirupati-Hackathon
+
+**AI/ML Hackathon — Ministry of Panchayati Raj (MoPR), Government of India**
+Organised by the **Geospatial Intelligence & Applications Laboratory, IIT
+Tirupati Navavishkar I-Hub Foundation**, in partnership with **IIIT
+Tirupati** and the **National Informatics Centre (NIC)**.
+
+| | Problem Statement 1 | Problem Statement 2 |
+|---|---|---|
+| **Goal** | Extract building/road/water/utility features from drone **orthophotos** | Generate a bare-earth **DTM** from LiDAR point clouds and design an optimised **drainage network** |
+| **Input** | RGB drone orthophoto GeoTIFFs + SVAMITVA cadastral shapefiles | Raw `.las`/`.laz` LiDAR point clouds |
+| **Core technique** | 3-model semantic segmentation ensemble (SegFormer + Mask2Former + custom dual-attention U-Net++) | PointNet-style regression (CSF ground filtering → `TerrainNet`) + D8 hydrology (`pysheds`) |
+| **Output** | 10-class feature raster / GeoPackage (roofs by material, roads, waterbodies, transformers, tanks, wells) | DTM GeoTIFF + drainage-network & waterlogging GeoJSON |
+| **Code** | [`hack.ipynb`](./hack.ipynb), [`Hackathon.ipynb`](./Hackathon.ipynb) | [`DTM_OptimizedDrainageGeneration-main/`](./DTM_OptimizedDrainageGeneration-main) |
+| **Sample data/outputs** | — | [`SVAMITVA_Data_DTM_MULTI-.../`](./SVAMITVA_Data_DTM_MULTI-20260623T143209Z-3-001) |
+
+---
+
+## Table of contents
+
+- [Background — what is SVAMITVA and why does this matter](#background--what-is-svamitva-and-why-does-this-matter)
+- [The problem, in plain terms](#the-problem-in-plain-terms)
+- [Repository structure](#repository-structure)
+- [Problem Statement 1 — Feature Extraction](#problem-statement-1--ai-based-feature-extraction-from-drone-orthophotos)
+- [Problem Statement 2 — DTM & Drainage](#problem-statement-2--dtm-generation--optimized-drainage-network)
+- [Glossary — terms used throughout this repo](#glossary--terms-used-throughout-this-repo)
+- [Getting started](#getting-started)
+- [Data](#data)
+- [Results summary](#results-summary)
+- [Tech stack](#tech-stack)
+- [Acknowledgements](#acknowledgements)
+
+---
+
+## Background — what is SVAMITVA and why does this matter
+
+**SVAMITVA** (Survey of Villages Abadi and Mapping with Improvised
+Technology in Village Areas) is a Government of India scheme that uses
+drones to survey the *abadi* (inhabited) areas of rural villages — something
+that had never been comprehensively mapped before. Each drone flight
+produces two kinds of raw data:
+
+- A high-resolution **orthophoto** — essentially a distortion-corrected
+  aerial photograph, accurate enough that a building's edges on the image
+  line up with its true position on the ground.
+- For some villages, a **LiDAR point cloud** — millions of individual 3D
+  points (x, y, z + extra attributes like intensity and return number)
+  captured by a laser scanner mounted on the drone, dense enough to
+  reconstruct both the ground surface and everything sitting on it
+  (buildings, trees, poles).
+
+This raw data is extremely rich, but on its own it's just pixels and point
+coordinates — it doesn't tell a Panchayat official *which* buildings exist,
+*what* they're made of, *where* the roads and water bodies are, or *how*
+water will flow across the terrain during monsoon. Turning raw drone data
+into that kind of actionable planning information has historically required
+GIS technicians to manually trace features on screen, village by village —
+a process that does not scale to the 600,000+ villages SVAMITVA eventually
+aims to cover.
+
+This hackathon challenged teams to close that gap with AI/ML, working with
+real SVAMITVA data from multiple Indian states.
+
+---
+
+## The problem, in plain terms
+
+Two related but distinct problems were posed, and this repository answers
+both:
+
+**Problem Statement 1** asks: *"Given a drone photo of a village, can a
+model automatically tell us what's on the ground?"* — i.e., look at the
+orthophoto the way a human GIS technician would, and label every pixel as
+one of: background, a specific roof material (RCC/tiled/tin/thatched), road,
+waterbody, or one of three small utility structures (transformer, overhead
+tank, well). This is a **computer vision / semantic segmentation** problem.
+
+**Problem Statement 2** asks: *"Given a raw LiDAR scan of a village, can a
+model figure out the true shape of the bare ground (ignoring buildings and
+trees), and then tell us where rainwater will naturally flow or pool?"*
+This has two parts: first a **3D point-cloud regression** problem (predict
+ground elevation at every location), and then a **classical hydrology
+simulation** on top of that predicted terrain to trace drainage paths and
+flag flood/waterlogging risk zones.
+
+The two problems are complementary pieces of the same larger picture: once
+you know *what* is on the land (Problem Statement 1) and *what shape* the
+land is (Problem Statement 2), a Panchayat has enough information to plan
+infrastructure — including drainage systems that actually work with the
+terrain instead of against it — without commissioning a brand-new survey.
+
+---
+
+## Repository structure
+IIT-Tirupati-Hackathon/
+├── README.md
+├── hack.ipynb                                    ← Problem Statement 1, FINAL pipeline
+│                                                     (3-model segmentation ensemble)
+├── Hackathon.ipynb                               ← Problem Statement 1, EARLIER pipeline
+│                                                     (U-Net + Faster R-CNN, real training logs
+│                                                      + saved visualisations)
+│
+├── DTM_OptimizedDrainageGeneration-main/
+│   └── DTM_OptimizedDrainageGeneration-main/
+│       ├── DTM_Multi_Train.ipynb                 ← Problem Statement 2, Stage A:
+│       │                                            point cloud → TerrainNet → DTM
+│       └── DTM2OptimizedDrainageSystem.ipynb      ← Problem Statement 2, Stage B:
+│                                                     DTM → drainage network + waterlogging
+│
+└── SVAMITVA_Data_DTM_MULTI-20260623T143209Z-3-001/
+└── SVAMITVA_Data_DTM_MULTI/
+├── DSM_FILES/                            ← raw Digital Surface Models (6 villages)
+├── DTM_FILES/                            ← model-generated Digital Terrain Models
+├── SVAMITVA_Drainage_Output/              ← per-village drainage PNG + GeoJSON
+├── all_dtms_preview.png
+├── best_terrainnet.pth                   ← trained TerrainNet weights
+└── GeoIntel Drainage optimization Submission Doc.pdf   ← official submission writeup
+
+> `hack.ipynb` and `Hackathon.ipynb` both solve **Problem Statement 1** —
+> they are two different generations of the same pipeline, not two separate
+> problem statements. The breakdown below explains what changed between
+> them and why.
+
+---
+
+## Problem Statement 1 — AI-Based Feature Extraction from Drone Orthophotos
+
+> *"Develop an AI/ML model to identify key features from SVAMITVA Scheme
+> drone orthophotos."* — official scope
+
+### What "feature extraction" means here
+
+Every pixel in a village orthophoto is assigned exactly one of 10 labels.
+This is a **10-class semantic segmentation** problem — the model doesn't
+just say "there's a building somewhere in this image", it draws the precise
+outline of every building, road and water body, and additionally decides
+*what kind* of roof each building has (which matters a lot for rural
+planning, since RCC/tiled/tin/thatched roofs imply very different levels of
+housing quality and flood/fire vulnerability).
+
+| ID | Class | Source shapefile | Why it matters for planning |
+|----|-------|-------------------|------------------------------|
+| 0 | Background | — | Everything that isn't a mapped feature |
+| 1 | RCC Roof | `Built_Up_Area_type.shp` | Pucca (permanent, concrete) housing |
+| 2 | Tiled Roof | `Built_Up_Area_type.shp` | Semi-permanent housing |
+| 3 | Tin Roof | `Built_Up_Area_type.shp` | Semi-permanent housing, heat/fire risk |
+| 4 | Thatched Roof | `Built_Up_Area_type.shp` | Kutcha (temporary) housing, highest vulnerability |
+| 5 | Road | `Road.shp` | Access & connectivity planning |
+| 6 | Waterbody | `Water_Body.shp` | Water resource & flood-risk mapping |
+| 7 | Transformer | `Utility.shp` | Electrical infrastructure inventory |
+| 8 | Tank | `Utility.shp` | Water storage infrastructure inventory |
+| 9 | Well | `Utility.shp` | Water source infrastructure inventory |
+
+The ground-truth labels for training aren't hand-drawn from scratch — they
+come from **rasterising the SVAMITVA cadastral shapefiles** (vector polygons
+already digitised for the surveyed villages) directly onto the orthophoto's
+pixel grid, so every training pixel inherits the label of whatever
+shapefile polygon it falls inside.
+
+### `Hackathon.ipynb` — the earlier, two-headed pipeline
+
+This was the first working end-to-end version, developed and run on an HPC
+cluster (`/nfsshare/users/manjula/svamitva_project`). Its key design insight
+is that the 10 classes aren't all the same *shape* of problem:
+
+- Roofs, roads and waterbodies are **large, contiguous regions** — a
+  standard segmentation network handles these well.
+- Transformers, tanks and wells are **tiny, sparse, point-like objects**
+  (sometimes just a few pixels wide) — a segmentation network trained mostly
+  on huge background/road/roof regions tends to simply ignore them, because
+  getting them wrong barely moves the loss.
+
+So this version **splits the problem into two specialised models** trained
+independently:
+
+| Stage | What happens | Output |
+|---|---|---|
+| 1 — Mask generation | Orthophoto TIFs + the 5 SVAMITVA shapefiles are rasterised into per-pixel label masks, one mask per village | `data/training/masks_raster/*.tif` |
+| 2 — Patch extraction | Village rasters — some as large as 235,000 × 119,000 pixels, far too big to feed a network directly — are tiled into 256×256 patches, skipping tiles that are almost entirely empty background | `data/training/patches/{images,masks}/` |
+| 3 — Minority-class augmentation | Rare classes (utilities, thatched roofs) are deliberately oversampled/augmented so they aren't drowned out by the overwhelmingly common background/roof pixels | same patch dirs |
+| 4 — Train DuSA U-Net | A dual-attention U-Net is trained purely for pixel-wise roof/road/water segmentation | `outputs/best_model.pth` |
+| 5 — Train Faster R-CNN | A **Faster R-CNN object detector** — a completely different architecture, designed for finding bounding boxes rather than pixel masks — is trained specifically to localise transformers/tanks/wells, using hard-negative mining (deliberately showing it background patches that superficially resemble utilities) to cut down false positives | `outputs/final/faster_rcnn_utilities.pth` |
+| 6 — Inference | Both trained models are run independently over held-out test villages | `outputs/predictions/`, `outputs/rcnn_utilities/` |
+| 7 — Merge / evaluate / visualise | The U-Net's region segmentation and the R-CNN's utility detections are merged into a single combined feature layer, and evaluation metrics + comparison charts are generated | `outputs/final_predictions/` |
+
+**Real logged training results** (captured directly in the notebook's saved
+outputs, not simulated) — Faster R-CNN utility detector, 40 epochs over
+4,275 training / 1,069 validation patches:
+
+| Epoch | Precision | Recall | What this tells us |
+|-------|-----------|--------|----------------------|
+| 1 | 100.00% | 0.42% | Model is barely detecting anything yet — every prediction it *does* make happens to be correct, but it's finding almost none of the true utilities |
+| 10 | 88.81% | 82.30% | Rapid early improvement as the detector learns what a transformer/tank/well looks like |
+| 20 | 91.87% | 85.24% | Gains are slowing — the model is converging |
+| 40 | 91.39% | 86.70% | Final plateau: roughly 9 in 10 predicted utility detections are correct, and the model finds about 87% of all true utilities in the validation set |
+
+This precision/recall trade-off curve — starting at perfect-but-useless
+precision and gradually trading a little precision for much more recall — is
+a classic signature of a detector learning to loosen an overly conservative
+initial decision boundary.
+
+CLI (defined inside the notebook itself):
+```bash
+python svamitva_pipeline.py --stage all      # everything, stages 1 through 7
+python svamitva_pipeline.py --stage 1        # masks only
+python svamitva_pipeline.py --stage 1,2,3    # data preparation only
+python svamitva_pipeline.py --stage 4,5      # training only
+```
+
+### `hack.ipynb` — the final, unified ensemble pipeline
+
+The final version rethinks the two-headed approach. Rather than maintaining
+two entirely different architectures (and two entirely different inference
+paths that then need to be merged), it treats **all 10 classes — including
+the tiny utility points — as one segmentation problem**, and compensates for
+the size imbalance a different way: by giving each class its own
+confidence threshold and minimum-detection-size at inference time (a
+transformer only needs a handful of confident pixels to count as "found";
+a road needs a much larger contiguous blob before it's trusted). Three
+different segmentation architectures are trained completely independently
+and then combined with a weighted vote — the reasoning being that different
+architectures make *different kinds* of mistakes, so combining them
+smooths out each one's individual weaknesses.
+
+**The three models in the ensemble, and what each contributes:**
+
+| Model | Backbone | Architectural idea | Why it's in the ensemble |
+|---|---|---|---|
+| `DuSAUNetPP` | Custom U-Net++ style encoder-decoder built from scratch, with **Channel Attention** (learns *which feature channels* matter most) and **Spatial Attention** (learns *which spatial locations* matter most) blocks at every decoder stage, plus an **ASPP** bottleneck (Atrous Spatial Pyramid Pooling — convolutions at multiple dilation rates 1/6/12/18 to see the image at multiple zoom levels simultaneously) and auxiliary supervision heads partway through the decoder | Trained entirely from scratch on this data, so it isn't biased by whatever a general-purpose pretrained model was originally trained to look for | Produces the sharpest object *boundaries* — important for accurately measuring building footprint area |
+| `SegFormerB5` | HuggingFace `nvidia/segformer-b5-finetuned-ade-640-640`, a transformer-based segmentation model, fine-tuned from its pretrained weights down to 10 classes | Self-attention lets every pixel "see" the entire image, not just a local neighbourhood | Best at understanding large-scale context — e.g. correctly extending a waterbody's boundary even where it's partly obscured |
+| `Mask2FormerSeg` | HuggingFace `facebook/mask2former-swin-base-coco-panoptic`, a query-based segmentation model, fine-tuned to 10 classes | Instead of classifying pixels directly, it learns a fixed set of "queries" that each learn to find one object instance and its mask | Best at separating buildings that sit right next to each other, which pure per-pixel classifiers often blur together |
+
+The `EnsembleModel` class combines the three models' softmax probability
+maps with tunable weights `(w_segformer, w_mask2former, w_unetpp)`,
+defaulting to `(0.45, 0.35, 0.20)` — SegFormer's global context is trusted
+most, followed by Mask2Former, with the from-scratch U-Net contributing the
+least (but still meaningfully, especially for boundary precision).
+
+**Loss function** — training uses a `CombinedLoss` that blends four
+different objectives, because no single loss captures everything a good
+segmentation model needs:
+loss = 0.3 · LabelSmoothingCE   (standard classification loss, softened
+slightly so the model isn't overconfident)
++ 0.4 · DiceLoss           (directly rewards overlap between predicted
+and true regions — robust to class imbalance)
++ 0.2 · FocalLoss(γ=2)     (down-weights easy/already-correct pixels so
+training focuses on hard, ambiguous ones)
++ 0.1 · BoundaryLoss       (specifically penalises errors right at
+object edges, where segmentation models
+usually struggle most)
 Per-class weights inside these losses are derived from inverse class
 frequency, since background pixels dominate the dataset (≈65% of all
 pixels) while a class like "well" makes up under 1% — without this
