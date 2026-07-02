@@ -564,9 +564,6 @@ top-to-bottom.
     technology stack, results, and future roadmap (much of this README's
     Problem Statement 2 section is drawn directly from it)
 
-For the full source dataset — including additional villages and the raw
-point clouds — see the Google Drive link referenced inside the submission
-PDF.
 
 ---
 
